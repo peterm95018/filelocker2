@@ -12,3 +12,5 @@ We have a successful test environment working. Here is our configuration:
 * Filelocker2 v2.4 upgraded to 2.6
 
 Our campus IDP provides us (the SP) with basic attributes upon a successful authentication. Apache sets these attributes as RequestHeaders. We then pull information into Filelocker2 where needed.
+
+We did some of our initial development using a Docker container and setting up a workstation to act as a SP. Using http://testshib.org we were able to create a successful authentication flow and proceed into testing on a development VM.
