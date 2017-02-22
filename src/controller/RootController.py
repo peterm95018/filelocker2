@@ -61,6 +61,12 @@ class RootController:
             return str(tpl)
         elif authType == "cas":
             raise cherrypy.HTTPRedirect(config['root_url'])
+        elif authType == "saml":
+            username = cherrypy.request.headers['X-UID']
+            # TODO decide on whether to set a local password that won't be used
+            password = str(os.urandom(32).encode('hex'))[0:32]
+            # move ahead to process_login
+            self.process_login(username, password)
         else:
             cherrypy.log.error("[system] [login] [No authentication variable set in config]")
             raise cherrypy.HTTPError(403, "No authentication mechanism")
