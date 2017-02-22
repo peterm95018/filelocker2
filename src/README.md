@@ -9,7 +9,7 @@ We have a successful test environment working. Here is our configuration:
 * Apache 2.2.15
 * MySQL 5.1.73
 * Shibd 2.6.0
-* Filelocker2 v2.4 upgraded to 2.6
+* Filelocker2 v2.6
 
 Our campus IDP provides us (the SP) with basic attributes upon a successful authentication. Apache sets these attributes as RequestHeaders. We then pull information into Filelocker2 where needed.
 
