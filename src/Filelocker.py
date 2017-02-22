@@ -1,403 +1,505 @@
 # -*- coding: utf-8 -*-
-__author__="wbdavis"
-__date__ ="$Sep 25, 2011 9:09:40 PM$"
-__version__ = "2.6"
-import sys
-import ConfigParser
+import re
 import os
-import time
-import signal
-import errno
-import logging
 import datetime
 import cherrypy
-import StringIO
-from cherrypy.process import plugins
-from Cheetah.Template import Template
-from lib.SQLAlchemyTool import configure_session_for_app, session
+import Filelocker
+from lib.SQLAlchemyTool import session
 import sqlalchemy
-from lib import FileService
-from lib.CAS import CAS
+from Cheetah.Template import Template
 from lib.Constants import Actions
+from lib import Encryption
 from lib.Models import *
+from lib import AccountService
+from lib import FileService
+from lib import ShareService
 from lib.Formatters import *
-from lib.FileFieldStorage import FileFieldStorage
+__author__="wbdavis"
+__date__ ="$Sep 25, 2011 9:36:56 PM$"
 
-cherrypy.server.max_request_body_size = 0
-def before_upload(**kwargs):
-    cherrypy.request.process_request_body = False
-cherrypy.tools.before_upload = cherrypy.Tool('before_request_body', before_upload, priority=71)
+class RootController:
+    import FileController
+    import ShareController
+    import MessageController
+    import AdminController
+    import AccountController
+    import CLIController
+    share = ShareController.ShareController()
+    file = FileController.FileController()
+    account = AccountController.AccountController()
+    admin = AdminController.AdminController()
+    message = MessageController.MessageController()
+    cli = CLIController.CLIController()
+    #DropPrivileges(cherrypy.engine, umask=077, uid='nobody', gid='nogroup').subscribe()
 
-def requires_login(permissionId=None, **kwargs):
-    from lib import AccountService
-    format, rootURL = None, cherrypy.request.app.config['filelocker']['root_url']
-    if cherrypy.request.params.has_key("format"):
-        format = cherrypy.request.params['format']
-    if cherrypy.session.has_key("user") and cherrypy.session.get('user') is not None:
-        user = cherrypy.session.get('user')
-        if user.date_tos_accept == None:
-            raise cherrypy.HTTPRedirect(rootURL+"/sign_tos")
-        elif permissionId is not None:
-            try:
-                if not AccountService.user_has_permission(user, permissionId):
-                    raise cherrypy.HTTPError(403)
-            except Exception, e:
-                raise cherrypy.HTTPError(500, "The server is having problems communicating with the database server. Please try again in a few minutes.")
+    def __init__(self):
+        pass
+
+    @cherrypy.expose
+    def local(self, **kwargs):
+        raise cherrypy.HTTPRedirect("%s/login?local=%s" % (cherrypy.request.app.config['filelocker']['root_url'], str(True)))
+
+    @cherrypy.expose
+    def login(self, **kwargs):
+        msg, errorMessage, config = ( None, None, cherrypy.request.app.config['filelocker'])
+        authType = session.query(ConfigParameter).filter(ConfigParameter.name=="auth_type").one().value
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        if kwargs.has_key("msg"):
+            msg = kwargs['msg']
+        if kwargs.has_key("local") and kwargs['local']==str(True):
+            authType = "local"
+
+        loginPage = config['root_url'] + "/process_login"
+        if msg is not None and str(strip_tags(msg))=="1":
+            errorMessage = "Invalid username or password"
+        elif msg is not None and str(strip_tags(msg))=="2":
+            errorMessage = "You have been logged out of the application"
+        elif msg is not None and str(strip_tags(msg))=="3":
+            errorMessage = "Password cannot be blank"
+
+        if authType == "ldap" or authType == "local":
+            currentYear = datetime.date.today().year
+            footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+            tpl = Template(file=get_template_file('login.tmpl'), searchList=[locals(),globals()])
+            return str(tpl)
+        elif authType == "cas":
+            raise cherrypy.HTTPRedirect(config['root_url'])
+        elif authType == "saml": #PSM
+            username = cherrypy.request.headers['X-UID']
+            # Set passwd to random number
+            # move ahead to process_login
+            password = str(os.urandom(32).encode('hex'))[0:32]
+            self.process_login(username, password)
         else:
-            pass
-    else:
-        authType = None
-        try:
-            authType = session.query(ConfigParameter).filter(ConfigParameter.name=="auth_type").one().value
-            if authType == "cas":
-                casUrl = session.query(ConfigParameter).filter(ConfigParameter.name=="cas_url").one().value
-                casConnector = CAS(casUrl)
-                if cherrypy.request.params.has_key("ticket"):
-                    valid_ticket, userId = casConnector.validate_ticket(rootURL, cherrypy.request.params['ticket'])
-                    if valid_ticket:
-                        currentUser = AccountService.get_user(userId, True)
-                        if currentUser is None:
-                            currentUser = User(id=userId, display_name="Guest user", first_name="Unknown", last_name="Unknown")
-                            cherrypy.log.error("[%s] [requires_login] [User authenticated, but not found in directory - installing with defaults]"%str(userId))
-                            AccountService.install_user(currentUser)
-                            currentUser = AccountService.get_user(currentUser.id, True) #To populate attributes
-                        if not currentUser.authorized:
-                            raise cherrypy.HTTPError(403, "Your user account does not have access to this system.")
-                        session.add(AuditLog(currentUser.id, "Login", "User %s logged in successfully from IP %s" % (currentUser.id, cherrypy.request.remote.ip)))
+            cherrypy.log.error("[system] [login] [No authentication variable set in config]")
+            raise cherrypy.HTTPError(403, "No authentication mechanism")
 
-                        session.commit()
-                        if currentUser.date_tos_accept is None:
-                            if format == None:
-                                raise cherrypy.HTTPRedirect(rootURL+"/sign_tos")
-                            else:
-                                raise cherrypy.HTTPError(401)
-                        raise cherrypy.HTTPRedirect(rootURL)
-                    else:
-                        raise cherrypy.HTTPError(403, "Invalid CAS Ticket. If you copied and pasted the URL for this server, you might need to remove the 'ticket' parameter from the URL.")
-                else:
-                    if format == None:
-                        raise cherrypy.HTTPRedirect(casConnector.login_url(rootURL))
-                    else:
-                        raise cherrypy.HTTPError(401)
-            else:
-                if format == None:
-                    raise cherrypy.HTTPRedirect(rootURL+"/login")
-                else:
-                    raise cherrypy.HTTPError(401)
-        except cherrypy.HTTPRedirect, redirect:
-            raise redirect
-        except cherrypy.HTTPError, httpe:
-            raise httpe
-        except Exception, e:
-            cherrypy.log.error("Unable to check parameter auth_type:(%s) %s" % (str(type(e)), str(e)))
-            raise cherrypy.HTTPError(500, "The server is having problems communicating with the database server. Please try again in a few minutes.")
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def logout(self):
+        config = cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        authType = session.query(ConfigParameter).filter(ConfigParameter.name=="auth_type").one().value
+        if authType == "cas":
+            from lib.CAS import CAS
+            casUrl = session.query(ConfigParameter).filter(ConfigParameter.name=="cas_url").one().value
+            casConnector = CAS(casUrl)
+            casLogoutUrl =  casConnector.logout_url()+"?redirectUrl="+config['root_url']+"/logout_cas"
+            currentYear = datetime.date.today().year
+            footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+            tpl = Template(file=get_template_file('cas_logout.tmpl'), searchList=[locals(), globals()])
+            cherrypy.session['user'], cherrypy.response.cookie['filelocker']['expires'] = None, 0
+            return str(tpl)
+        elif authType == "saml":
+            shibboleth_logout_url = session.query(ConfigParameter).filter(ConfigParameter.name=="shibboleth_logout_url").one().value
+            cherrypy.session['user'], cherrypy.response.cookie['filelocker']['expires'] = None, 0
+            raise cherrypy.HTTPRedirect(shibboleth_logout_url)
+            #raise cherrypy.HTTPRedirect(config['root_url']+'/login?msg=2')
+        else:
+            cherrypy.session['user'], cherrypy.response.cookie['filelocker']['expires'] = None, 0
+            raise cherrypy.HTTPRedirect(config['root_url']+'/login?msg=2')
 
-cherrypy.tools.requires_login = cherrypy.Tool('before_request_body', requires_login, priority=70)
+    @cherrypy.expose
+    def logout_cas(self):
+        from lib.CAS import CAS
+        config = cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        currentYear = datetime.date.today().year
+        footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+        tpl = Template(file=get_template_file('cas_logout_confirmation.tmpl'), searchList=[locals(), globals()])
+        return str(tpl)
 
-def error(status, message, traceback, version):
-    currentYear = datetime.date.today().year
-    config = cherrypy.request.app.config['filelocker']
-    orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
-    footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
-    tpl = str(Template(file=get_template_file('error.tmpl'), searchList=[locals(),globals()]))
-    return tpl
+    @cherrypy.expose
+    def process_login(self, username, password, **kwargs):
+        rootURL, local = cherrypy.request.app.config['filelocker']['root_url'], False
+        if kwargs.has_key("local") and kwargs['local'] == str(True):
+            local = True
+        username = strip_tags(username)
 
-def cluster_elections(config):
-    try:
-        currentNodeId = int(config['filelocker']['cluster_member_id'])
-        currentNode = session.query(ClusterNode).filter(ClusterNode.member_id == currentNodeId).scalar()
-        if currentNode is None: #This node isn't in the DB yet, check in
-            import socket
-            currentNode = ClusterNode(member_id=currentNodeId, hostname=socket.gethostname(), is_master=False, last_seen_timestamp=datetime.datetime.now())
-            session.add(currentNode)
-            session.commit()
-        else: #In the DB, update last seen to avoid purging
-            currentNode.last_seen_timestamp = datetime.datetime.now()
-            session.commit()
-        currentMaster = session.query(ClusterNode).filter(ClusterNode.is_master==True).scalar()
-        #If this is default master node and another node has assumed master, reset and force election
-        if currentNodeId==0 and currentNode.is_master == False and currentMaster is not None:
-            for node in session.query(ClusterNode).all():
-                node.is_master = False
-            session.commit()
-        #This isn't the default master, there is one, but it's expired
-        elif currentMaster is not None and currentMaster.last_seen_timestamp < datetime.datetime.now()-datetime.timedelta(minutes=5): #master is expired
-            session.delete(currentMaster)
-            session.commit()
-        #No master, hold election
-        elif currentMaster is None: #No master nodes found, become master if eligible
-            purge_expired_nodes()
-            highestPriority = currentNode.member_id
-            for node in session.query(ClusterNode).all():
-                if node.member_id < highestPriority:
-                    highestPriority = node.member_id
-                    break
-            if highestPriority == currentNode.member_id: #Current node has lowest node id, thus highest priority, assume master
-                currentNode.is_master = True
-                session.commit()
-        return True
-    except sqlalchemy.orm.exc.ConcurrentModificationError, cme:
-        cherrypy.log.error("[system] [cluster_elections] [Concurrency error during elections. This can occur if locks on the DB inhibit normal cluster elections. If this error occurs infrequently, it can usually be disregarded. Full Error: %s]" % str(cme))
-        session.rollback()
-        return False
-    except Exception, e:
-        cherrypy.log.error("[system] [cluster_elections] [Concurrency error during elections. This can occur if locks on the DB inhibit normal cluster elections. If this error occurs infrequently, it can usually be disregarded. Full Error: %s]" % str(e))
-        session.rollback()
-        return False
-        
-def purge_expired_nodes():
-    #Clean node table, check for master, if none run election
-    expirationTime = datetime.datetime.now()-datetime.timedelta(minutes=5)
-    expiredNodes = session.query(ClusterNode).filter(ClusterNode.last_seen_timestamp < expirationTime).all()
-    for node in expiredNodes:
-        session.delete(node)
-    session.commit()
+        if password is None or password == "":
+            raise cherrypy.HTTPRedirect("%s/login?msg=3&local=%s" % (rootURL, str(local)))
+        else:
+            # we have a password
+            directory = AccountService.ExternalDirectory(local)
 
-def clean_temp_files(config):
-    #Cleanup orphaned temp files, possibly resulting from stalled transfers
-    validTempFiles = []
-    for key in cherrypy.file_uploads.keys():
-        for progressFile in cherrypy.file_uploads[key]:
-            validTempFiles.append(progressFile.file_object.name.split(os.path.sep)[-1])
-    FileService.clean_temp_files(config, validTempFiles)
-    
-def routine_maintenance(config):
-    from lib import AccountService
-    expiredFiles = session.query(File).filter(File.date_expires < datetime.datetime.now())
-    for flFile in expiredFiles:
-        try:
-            for share in flFile.user_shares:
-                session.delete(share)
-            for share in flFile.group_shares:
-                session.delete(share)
-            for share in flFile.public_shares:
-                session.delete(share)
-            for share in flFile.attribute_shares:
-                session.delete(share)
-            FileService.queue_for_deletion(flFile.id)
-            session.add(AuditLog("admin", Actions.DELETE_FILE, "File %s (ID:%s) has expired and has been purged by the system." % (flFile.name, flFile.id), flFile.owner_id))
-            session.delete(flFile)
-            session.commit()
-        except Exception, e:
-            session.rollback()
-            cherrypy.log.error("[system] [routine_maintenance] [Error while deleting expired file: %s]" % str(e))
-    expiredMessages = session.query(Message).filter(Message.date_expires < datetime.datetime.now())
-    for message in expiredMessages:
-        try:
-            session.delete(message)
-            FileService.queue_for_deletion("m%s" % str(message.id))
-            session.add(AuditLog("admin", Actions.DELETE_MESSAGE, "Message %s (ID:%s) has expired and has been deleted by the system." % (message.messageSubject, message.messageId), message.owner_id))
-            session.commit()
-        except Exception, e:
-            session.rollback()
-            cherrypy.log.error("[system] [routine_maintenance] [Error while deleting expired message: %s]" % str(e))
-    expiredUploadRequests = session.query(UploadRequest).filter(UploadRequest.date_expires < datetime.datetime.now())
-    for uploadRequest in expiredUploadRequests:
-        try:
-            session.delete(uploadRequest)
-            session.add(AuditLog("system", Actions.DELETE_UPLOAD_REQUEST, "Upload request %s has expired." % uploadRequest.id, uploadRequest.owner_id))
-            session.commit()
-        except Exception, e:
-            cherrypy.log.error("[system] [routine_maintenance] [Error while deleting expired upload request: %s]" % (str(e)))
-    maxUserDays = int(session.query(ConfigParameter).filter(ConfigParameter.name=="user_inactivity_expiration").one().value)
-    expiredUsers = session.query(User).filter(and_(User.date_last_login < (datetime.date.today() - datetime.timedelta(days=maxUserDays)), User.id!= "admin"))
-    
-    for user in expiredUsers:
-        if AccountService.user_has_permission(user, "admin") == False and AccountService.user_has_permission(user, "expiration_exempt") == False:
-            cherrypy.log.error("Purging user %s" % user.id)
-            session.delete(user)
-            session.add(AuditLog("admin", Actions.DELETE_USER, "User %s was deleted due to inactivity. All files and shares associated with this user have been purged as well" % str(user.id)))
-            session.commit()
+            if directory.authenticate(username, password):
+                cherrypy.session['request-origin'] = str(os.urandom(32).encode('hex'))[0:32]
+                currentUser = AccountService.get_user(username, True) #if they are authenticated and local, this MUST return a user object
 
-    for ps in session.query(PublicShare).all():
-        if len(ps.files) == 0:
-            session.delete(ps)
-            session.add(AuditLog("admin", Actions.DELETE_PUBLIC_SHARE, "Public share %s owned by %s had no files and was deleted by maintenance" % (ps.id, ps.owner_id if ps.role_owner_id is None else ps.role_owner_id)))
-    session.commit()
-
-    vaultFileList = os.listdir(config['filelocker']['vault'] )
-    for fileName in vaultFileList:
-        try:
-            if fileName.endswith(".tmp")==False and fileName.startswith(".") == False and fileName !="custom": #this is a file id, not a temp file
-                if fileName.startswith("m"):
-                    messageId = fileName.split("m")[1]
+                if currentUser is not None:
+                    if not currentUser.authorized:
+                        raise cherrypy.HTTPError(403, "You do not have permission to access this system")
+                    session.add(AuditLog(cherrypy.session.get("user").id, "Login", "User %s logged in successfully from IP %s" % (currentUser.id, Filelocker.get_client_address())))
+                    session.commit()
+                    raise cherrypy.HTTPRedirect(rootURL)
+                else: #This should only happen in the case of a user existing in the external directory, but having never logged in before
                     try:
-                        session.query(Message).filter(Message.id==messageId).one()
-                    except sqlalchemy.orm.exc.NoResultFound, nrf:
-                        FileService.queue_for_deletion(fileName)
-                else:
-                    try:
-                        fileId = int(fileName)
-                        try:
-                            session.query(File).filter(File.id==fileId).one()
-                        except sqlalchemy.orm.exc.NoResultFound, nrf:
-                            FileService.queue_for_deletion(fileName)
+                        newUser = directory.lookup_user(username)
+                        AccountService.install_user(newUser)
+                        currentUser = AccountService.get_user(username, True)
+                        if currentUser is not None and currentUser.authorized != False:
+                            raise cherrypy.HTTPRedirect(rootURL)
+                        else:
+                            raise cherrypy.HTTPError(403, "You do not have permission to access this system")
                     except Exception, e:
-                        cherrypy.log.error("There was a file that did not match Filelocker's naming convention in the vault: %s. It has not been purged." % fileName)
-        except Exception, e:
-            cherrypy.log.error("[system] [routine_maintenance] [There was a problem while trying to delete an orphaned file %s: %s]" % (str(fileName), str(e)))
-            session.rollback()
-
-def midnightloghandler(fn, level, backups):
-    from logging import handlers
-    h = handlers.TimedRotatingFileHandler(fn, "midnight", 1, backupCount=backups)
-    h.setLevel(level)
-    h.setFormatter(cherrypy._cplogging.logfmt)
-    return h
-
-
-def start(configfile=None, daemonize=False, pidfile=None):
-    cherrypy.file_uploads = dict()
-    cherrypy.file_downloads = dict()
-    if configfile is None:
-        configfile = os.path.join(os.getcwd(),"etc","filelocker.conf")
-    cherrypy.config.update(configfile)
-    logLevel = 40
-
-    from controller import RootController
-    app = cherrypy.tree.mount(RootController.RootController(), '/', config=configfile)
-    
-    #The following section handles the log rotation
-    log = app.log
-    log.error_file = ""
-    log.error_log.addHandler(midnightloghandler(cherrypy.config['log.error_file'], logLevel, 30))
-    log.access_file = ""
-    log.access_log.addHandler(midnightloghandler(cherrypy.config['log.access_file'], logging.INFO, 7))
-
-    #This is just aliasing the engine for shorthand, from a code example
-    engine = cherrypy.engine
-    #Bind the error page to our custom one so it doesn't print a stack trace. The output of the error function is printed
-    cherrypy.config.update({'error_page.default': error})
-    # Only daemonize if asked to.
-    if daemonize:
-        # Don't print anything to stdout/sterr.
-        plugins.Daemonizer(engine).subscribe()
-    if pidfile is None:
-            pidfile = os.path.join(os.getcwd(),"filelocker.pid")
-    cherrypy.process.plugins.PIDFile(engine, pidfile).subscribe()
-    #This was from the example
-    if hasattr(engine, "signal_handler"):
-        engine.signal_handler.subscribe()
-    if hasattr(engine, "console_control_handler"):
-        engine.console_control_handler.subscribe()
-    
-
-
-    cherrypy._cpcgifs.FieldStorage = FileFieldStorage
-        
-    engine.start()
-    configure_session_for_app(app)
-    app.config['filelocker']['version'] = __version__
-    #Set max file size upload size, in bytes
-    try:
-        maxSizeParam = session.query(ConfigParameter).filter(ConfigParameter.name == "max_file_size").one()
-        maxSize = long(maxSizeParam.value)
-        cherrypy.config.update({'server.max_request_body_size': maxSize*1024*1024})
-    except Exception, e:
-        cherrypy.log.error("[system] [maintenance] [Problem setting max file size: %s]" % str(e))
-
-    #Maintenance Loop
-    try:
-        while True:
-            if cluster_elections(app.config): #only run the  
-                try:                
-                    currentNode = session.query(ClusterNode).filter(ClusterNode.member_id==int(app.config['filelocker']["cluster_member_id"])).one()
-                    if currentNode.is_master: # This will allow you set up other front ends that don't run maintenance on the DB or FS
-                        purge_expired_nodes()
-                        routine_maintenance(app.config)
-                        FileService.process_deletion_queue(app.config) #process deletion queue every 12 minutes
-                except Exception, e:
-                    cherrypy.log.error("[system] [maintenance] [There was a problem loading data for node[%s]: %s\nIf this message appears repeatedly there could be a problem with the election process. Verify that each cluster node has a unique ID in the config.]" % (app.config['filelocker']["cluster_member_id"], str(e)))
-            
-            try:
-                clean_temp_files(app.config)
-            except Exception, e:
-                cherrypy.log.error("[system] [maintenance] [There was an error while cleaning temp files: %s]" % str(e))
-            
-            time.sleep(60) #Sleep 15 seconds after everything is done
-    except KeyboardInterrupt, ki:
-        print "Keyboard Interrupt"
-        cherrypy.log.error("Keyboard interrupt")
-        engine.exit()
-        sys.exit(1)
-    except Exception, e:
-        print "Exception in maintenance loop: %s" % str(e)
-        cherrypy.log.error("Exception in maintenance loop: %s" % str(e))
-        engine.exit()
-        sys.exit(1)
-
-def stop(pidfile=None):
-    if pidfile is None:
-        pidfile = os.path.join(os.getcwd(),"filelocker.pid")
-    if os.path.isfile(pidfile):
-        FILE = open(pidfile, 'r')
-        pid = int(FILE.read().strip())
-        FILE.close()
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except os.error, args:
-            if args[0] != errno.ESRCH: # NO SUCH PROCESS
-                print "Error stopping: %s\n" % str(args[0])
+                        return "Unable to install user: %s" % str(e)
             else:
-                print "Stale PID file, removing...No such process\n"
-        except Exception, e:
-            print "Error stopping: %s\n" % str(e)
+                raise cherrypy.HTTPRedirect("%s/login?msg=1&local=%s" % (rootURL, str(local)))
+
+
+    @cherrypy.expose
+    def css(self, style):
+        rootURL = cherrypy.request.app.config['filelocker']['root_url']
+        cherrypy.response.headers['Content-Type'] = 'text/css'
+        staticDir = os.path.join(rootURL,"static")
+        styleFile = str("%s.css" % style)
+        return str(Template(file=get_template_file(styleFile), searchList=[locals(),globals()]))
+
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def index(self, **kwargs):
+        config = cherrypy.request.app.config['filelocker']
+        authType = session.query(ConfigParameter).filter(ConfigParameter.name=="auth_type").one().value
+        cliEnabled = session.query(ConfigParameter).filter(ConfigParameter.name=="cli_feature").one().value
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        user, originalUser = (cherrypy.session.get("user"),  cherrypy.session.get("original_user"))
+        maxDays = int(session.query(ConfigParameter).filter(ConfigParameter.name=='max_file_life_days').one().value)
+        roles = session.query(User).filter(User.id == user.id).one().roles
+        currentYear = datetime.date.today().year
+        startDateFormatted, endDateFormatted = None, None
+        today = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        sevenDays = datetime.timedelta(days=7)
+        sevenDaysAgo = today - sevenDays
+        sevenDaysAgo = sevenDaysAgo.replace(hour=0, minute=0, second=0, microsecond=0)
+        defaultExpiration = datetime.date.today() + (datetime.timedelta(days=maxDays))
+        startDateFormatted = sevenDaysAgo
+        endDateFormatted = today
+        messageSearchWidget = self.account.get_search_widget("messages")
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        banner = session.query(ConfigParameter).filter(ConfigParameter.name=='banner').one().value
+        defaultQuota = int(session.query(ConfigParameter).filter(ConfigParameter.name=='default_quota').one().value)
+        header = Template(file=get_template_file('header.tmpl'), searchList=[locals(),globals()])
+        lightboxen = str(Template(file=get_template_file('lightboxen.tmpl'), searchList=[locals(),globals()]))
+        footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+        footer = Template(file=get_template_file('footer.tmpl'), searchList=[locals(),globals()])
+        filesSection = self.files()
+        indexHTML = str(header) + str(filesSection) + str(footer)
+        self.saw_banner()
+        return str(indexHTML)
+
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def saw_banner(self, **kwargs):
+        cherrypy.session['sawBanner'] = True
+        return ""
+
+    @cherrypy.expose
+    def sign_tos(self, **kwargs):
+        config = cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        if cherrypy.session.has_key("user") and cherrypy.session.get("user") is not None:
+            user = cherrypy.session.get("user")
+            if kwargs.has_key('action') and kwargs['action']=="sign":
+                attachedUser = session.query(User).filter(User.id == user.id).one()
+                attachedUser.date_tos_accept = datetime.datetime.now()
+                cherrypy.session['user'] = attachedUser.get_copy()
+                session.commit()
+                raise cherrypy.HTTPRedirect(config['root_url'])
+            else:
+                currentYear = datetime.date.today().year
+                footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+                return str(Template(file=get_template_file('tos.tmpl'), searchList=[locals(),globals()]))
         else:
-            os.kill(pid, 9)
+            raise cherrypy.HTTPRedirect(config['root_url'])
 
-def check_updates(config):
-    if config.has_key("database"):
-        proceed = raw_input("""You appear to have an outdated style of config file and database schema.
-        Would you like to attempt to automatically port the database and config?[y/n]: """ )
-        if proceed.lower().startswith("y"):
-            confirm = raw_input("""\n(WARNING: This will completely
-        rebuild your current database by backing up your current data and rebuilding the tables. If this process is interrupted,
-        all user data may be lost. You can manually run a DB backup from the Filelocker.py executable by using the syntax \n
-        $> Filelocker.py -a backup_db\n\nThis command generates an XML data dump that can be imported later.)\n
-        Proceed with in place upgrade?[y/n]: """)
-            if confirm.lower().startswith("y"):
-                dburi = "mysql+mysqldb://%s:%s@%s/%s" % (config['database']['dbuser'], config['database']['dbpassword'], config['database']['dbhost'], config['database']['dbname'] )
-                backupFile = port_database(config, config['database']['dbhost'], config['database']['dbuser'], config['database']['dbpassword'],config['database']['dbname'])
-                print "Backup complete. Rebuilding database..."
-                build_database(dburi)
-                print "Filelocker requires an admin account to be set. You will now be prompted to create a local password for the local admin account"
-                create_admin(dburi)
-                
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def admin_console(self, **kwargs):
+        user, config = cherrypy.session.get("user"), cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        templateFiles = os.listdir(os.path.join(config['root_path'], "view"))
+        configParameters = session.query(ConfigParameter).order_by(ConfigParameter.name).all()
+        flUsers = session.query(User).slice(0,50)
+        flRoles = session.query(Role)
+        totalFileCount = session.query(func.count(File.id)).scalar()
+        totalUserCount = session.query(func.count(User.id)).scalar()
+        totalMessageCount = session.query(func.count(Message.id)).scalar()
+        currentUsersList = []
+        currentUploads = len(cherrypy.file_uploads)
+        logsFile = open(cherrypy.config["log.error_file"],"a+")
+        logs = tail(logsFile, 50)
+        attributes = AccountService.get_shareable_attributes_by_user(user)
+        currentUserIds = []
+        sessionCache = {}
+        sessionCache = cherrypy.session.cache
+        for key in sessionCache.keys():
+            try:
+                if sessionCache[key][0].has_key('user') and sessionCache[key][0]['user'] is not None and sessionCache[key][0]['user'].id not in currentUserIds:
+                    currentUser = sessionCache[key][0]['user']
+                    currentUsersList.append(currentUser)
+                    currentUserIds.append(currentUser.id)
+            except Exception, e:
+                cherrypy.log.error("[%s] [admin] [Unable to read user session: %s]" % (user.id, str(e)))
+        tpl = Template(file=get_template_file('admin.tmpl'), searchList=[locals(),globals()])
+        return str(tpl)
 
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def history(self, userId=None, startDate=None, endDate=None, logAction=None, format="html", **kwargs):
+        sMessages, fMessages, user, role= ([],[],cherrypy.session.get("user"),cherrypy.session.get("current_role"))
+        config = cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
 
-if __name__ == '__main__':
-    from optparse import OptionParser
+        userId = strip_tags(userId) if strip_tags(userId) != None else user.id
+        if (userId != user.id and AccountService.user_has_permission(user, "admin")==False):
+            raise cherrypy.HTTPError(403)
+        actionList, actionLogList = ([], [])
+        try:
+            startDateFormatted, endDateFormatted = None, None
+            sevenDays = datetime.timedelta(days=7)
+            today = datetime.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            sevenDaysAgo = today - sevenDays
+            sevenDaysAgo = sevenDaysAgo.replace(hour=0, minute=0, second=0, microsecond=0)
+            if startDate is not None:
+                try:
+                    startDateFormatted = datetime.datetime(*time.strptime(strip_tags(startDate), "%m/%d/%Y")[0:5])
+                except Exception, e:
+                    fMessages.append("Start date was not properly formatted")
+                    startDateFormatted = sevenDaysAgo
+            else:
+                startDateFormatted = sevenDaysAgo
+            if endDate is not None:
+                try:
+                    endDateFormatted = datetime.datetime(*time.strptime(strip_tags(endDate), "%m/%d/%Y")[0:5])
+                except Exception, e:
+                    fMessages.append("End date was not properly formatted")
+                    endDateFormatted = today
+            else:
+                endDateFormatted = today
+            actionLogListAtt = session.query(AuditLog).filter(and_(AuditLog.date >= startDateFormatted, AuditLog.date <= (endDateFormatted + datetime.timedelta(days=1)))).filter(or_(AuditLog.initiator_user_id==userId, AuditLog.affected_user_id==userId))
 
-    p = OptionParser()
-    p.add_option('-c', '--config', dest='configfile',
-                 help="specify config file")
-    p.add_option('-d', action="store_true", dest='daemonize',
-                 help="run the server as a daemon")
-    p.add_option('-p', '--pidfile', dest='pidfile', default=None,
-                 help="store the process id in the given file")
-    p.add_option('-a','--action', dest='action', default="start", help="action to perform (start, stop, restart, reconfig)")
-    options, args = p.parse_args()
+            if logAction is None or logAction == "" or logAction == "all_minus_login":
+                logAction = "all_minus_login"
+                actionLogListAtt = actionLogListAtt.filter(AuditLog.action != Actions.LOGIN)
+            elif logAction == "all":
+                logAction = "all"
+            else:
+                logAction = strip_tags(logAction)
+                actionLogListAtt = actionLogListAtt.filter(AuditLog.action == logAction)
 
-    dburi = None
-    configParser = ConfigParser.SafeConfigParser()
-    if options.configfile is not None:
-        configParser.read(options.configfile)
-    else:
-        configfile = os.path.join(os.getcwd(),"etc","filelocker.conf")
-        if not os.path.exists(configfile):
-            configfile = os.path.join("/","etc","filelocker.conf")
-        if not os.path.exists(configfile):
-            raise Exception('Could not find config file, please specify one using the -c option')
-        configParser.read(configfile)
-    dburi = configParser.get("/","tools.SATransaction.dburi").replace("\"", "").replace("'","")
+            for log in actionLogListAtt.all():
+                log.display_class = "%s_%s" % ("audit", log.action.replace(" ", "_").lower())
+                log.display_class = re.sub('_\(.*?\)', '', log.display_class) # Removes (You) and (Recipient) from Read Message actions
+                actionLogList.append(log)
+            actionNames = session.query(AuditLog.action).filter(or_(AuditLog.initiator_user_id==userId, AuditLog.affected_user_id==userId)).distinct()
+            #for actionLog in actionNames:
+                #if actionLog not in actionList:
+                    #actionList.append(actionLog.action)
+            actionList = Actions.ACTION_LIST
+        except Exception, e:
+            fMessages.append(str(e))
+        if format == "html":
+            tpl = Template(file=get_template_file('history.tmpl'), searchList=[locals(),globals()])
+            return str(tpl)
+        else:
+            actionLogJSONlist = []
+            for actionLog in actionLogList:
+                actionLogJSONlist.append(actionLog.get_dict())
+            return fl_response(sMessages, fMessages, format, data=actionLogJSONlist)
 
-    if options.action:
-        if options.action == "stop":
-            stop(options.pidfile)
-        elif options.action == "restart":
-            stop(options.pidfile)
-            start(options.configfile, options.daemonize, options.pidfile)
-        elif options.action == "start":
-            start(options.configfile, options.daemonize, options.pidfile)
-    else:
-        start(options.configfile, options.daemonize, options.pidfile)
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def files(self, **kwargs):
+        user, role, defaultExpiration, uploadRequests, userFiles, userShareableAttributes,attributeFilesDict,sharedFiles = (cherrypy.session.get("user"), cherrypy.session.get("current_role"), None, [], [], [], {}, [])
+        config = cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        maxDays = int(session.query(ConfigParameter).filter(ConfigParameter.name=='max_file_life_days').one().value)
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        adminEmail = session.query(ConfigParameter).filter(ConfigParameter.name=='admin_email').one().value
+        defaultExpiration = datetime.date.today() + (datetime.timedelta(days=maxDays))
+        userFiles = self.file.get_user_file_list(format="list")
+        if role is None:
+            uploadRequests = session.query(UploadRequest).filter(UploadRequest.owner_id==user.id).all()
+            userShareableAttributes = AccountService.get_shareable_attributes_by_user(user)
+            attributeFilesDict = ShareService.get_files_shared_with_user_by_attribute(user)
+            sharedFiles = ShareService.get_files_shared_with_user(user)
+        else:
+            userShareableAttributes = AccountService.get_shareable_attributes_by_role(role)
+        tpl = Template(file=get_template_file('files.tmpl'), searchList=[locals(),globals()])
+        return str(tpl)
+
+    @cherrypy.expose
+    def help(self, **kwargs):
+        defaultQuota = int(session.query(ConfigParameter).filter(ConfigParameter.name=='default_quota').one().value)
+        maxDays = int(session.query(ConfigParameter).filter(ConfigParameter.name=='max_file_life_days').one().value)
+        cliEnabled = session.query(ConfigParameter).filter(ConfigParameter.name=="cli_feature").one().value
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        tpl = Template(file=get_template_file('halp.tmpl'), searchList=[locals(),globals()])
+        return str(tpl)
+
+    @cherrypy.expose
+    @cherrypy.tools.requires_login()
+    def manage_groups(self, **kwargs):
+        user, config = cherrypy.session.get("user"), cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        groups = session.query(Group).filter(Group.owner_id==user.id).all()
+        tpl = Template(file=get_template_file('manage_groups.tmpl'), searchList=[locals(),globals()])
+        return str(tpl)
+
+    @cherrypy.expose
+    def toobig(self, **kwargs):
+        return fl_response([], ['File is too big'], "json")
+
+    @cherrypy.expose
+    def upload_request(self, requestId=None, msg=None, **kwargs):
+        user = None
+        messages, uploadRequest, requestId, config = [], None, strip_tags(requestId), cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        if msg is not None and int(msg) == 1: messages.append("You must supply a valid ID and password to upload files for this request")
+        if msg is not None and int(msg) == 2: messages.append("Unable to load upload request")
+        if msg is not None and int(msg) == 3: messages.append("Invalid password")
+        requestId = strip_tags(requestId)
+        if cherrypy.session.has_key("uploadRequest"):
+            raise cherrypy.HTTPRedirect(config['root_url']+'/upload_request_uploader?requestId=%s' % requestId)
+        elif requestId is not None:
+            try:
+                uploadRequest = session.query(UploadRequest).filter(UploadRequest.id == requestId).one()
+                if (uploadRequest.type == "single" and uploadRequest.password == None):
+                    raise cherrypy.HTTPRedirect(config['root_url']+'/upload_request_uploader?requestId=%s' % requestId)
+            except sqlalchemy.orm.exc.NoResultFound, nrf:
+                messages.append("Invalid upload request ID")
+        currentYear = datetime.date.today().year
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        banner = session.query(ConfigParameter).filter(ConfigParameter.name=='banner').one().value
+        headerHTML = str(Template(file=get_template_file('header.tmpl'), searchList=[locals(),globals()]))
+        footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+        footerHTML = str(Template(file=get_template_file('footer.tmpl'), searchList=[locals(),globals()]))
+        tpl = str(Template(file=get_template_file('public_upload_request.tmpl'), searchList=[locals(),globals()]))
+        uploadRequestHTML = headerHTML+tpl+footerHTML
+        return uploadRequestHTML
+
+    @cherrypy.expose
+    def upload_request_uploader(self, requestId=None, password=None, **kwargs):
+        user = None
+        format = "content_only" if kwargs.has_key("format") and kwargs["format"] == "content_only" else "html"
+        requestOwner, uploadRequest, tpl, messages, config = (None, None, None, [], cherrypy.request.app.config['filelocker'])
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        maxDays = int(session.query(ConfigParameter).filter(ConfigParameter.name=='max_file_life_days').one().value)
+        defaultExpiration = datetime.date.today() + (datetime.timedelta(days=maxDays))
+        requestFiles = []
+        requestId = strip_tags(requestId)
+        cherrypy.session['request-origin'] = str(os.urandom(32).encode('hex'))[0:32]
+        if requestId is not None:
+            if cherrypy.session.has_key("uploadRequest"):
+                if cherrypy.session.get("uploadRequest").id != requestId:
+                    #TODO session check deletion
+                    del(cherrypy.session['uploadRequest'])
+            if cherrypy.session.has_key("uploadRequest"): #Their requestId and the session uploadTicket's ID matched, let them keep the session
+                uploadRequestId = cherrypy.session.get("uploadRequest").id
+                uploadRequest = session.query(UploadRequest).filter(UploadRequest.id == uploadRequestId).scalar()
+                if uploadRequest is None: #Expired request, but they still have a valid session to view file
+                    uploadRequest = cherrypy.session.get("uploadRequest")
+                    uploadRequest.expired = True
+            elif password is None or password =="": #If they come in with a ticket - fill it in and prompt for password
+                try:
+                    uploadRequest = session.query(UploadRequest).filter(UploadRequest.id == requestId).one()
+                    if uploadRequest.password == None and uploadRequest.type == "single":
+                        cherrypy.session['uploadRequest'] = uploadRequest.get_copy()
+                    else:
+                        messages.append("This upload request requires a password before you can upload files")
+                        uploadRequest = None
+                        raise cherrypy.HTTPError(500, "Invalid password") if format == "content_only" else cherrypy.HTTPRedirect(config['root_url']+'/upload_request?requestId=%s&msg=3' % requestId)
+                    requestOwner = session.query(User).filter(User.id == uploadRequest.owner_id).one()
+                except cherrypy.HTTPError, httpe:
+                    raise httpe
+                except cherrypy.HTTPRedirect, httpr:
+                    raise httpr
+                except Exception, e:
+                    messages.append(str(e))
+            elif password is not None and password!="": # if they do have a password and requestId, try to load the whole upload ticket
+                uploadRequest = session.query(UploadRequest).filter(UploadRequest.id == requestId).one()
+                if Encryption.compare_password_hash(password, uploadRequest.password):
+                    cherrypy.session['uploadRequest'] = uploadRequest.get_copy()
+                    requestOwner = session.query(User).filter(User.id == uploadRequest.owner_id).one()
+                else:
+                    uploadRequest = None
+                    raise cherrypy.HTTPError(500, "Invalid password") if format == "content_only" else cherrypy.HTTPRedirect(config['root_url']+'/upload_request?requestId=%s&msg=3' % requestId)
+        elif cherrypy.session.has_key("uploadRequest"):
+            uploadRequest = cherrypy.session.get("uploadRequest")
+            requestOwner = session.query(User).filter(User.id == uploadRequest.owner_id).one()
+        else:
+            raise cherrypy.HTTPError(500, "Unable to load upload request") if format == "content_only" else cherrypy.HTTPRedirect("%s/upload_request?msg=1" % (config['root_url']))
+
+        if uploadRequest is not None:
+            fileList = session.query(File).filter(File.upload_request_id==uploadRequest.id).all()
+            for flFile in fileList:
+                flFile.documentType = "document"
+                requestFiles.append({'fileName': flFile.name, 'fileId': flFile.id, 'fileOwnerId': flFile.owner_id, 'fileSizeBytes': flFile.size, 'fileUploadedDatetime': flFile.date_uploaded.strftime("%m/%d/%Y") if flFile.date_uploaded is not None else "" , 'fileExpirationDatetime': flFile.date_expires.strftime("%m/%d/%Y") if flFile.date_expires is not None else "", 'filePassedAvScan':flFile.passed_avscan, 'documentType': flFile.document_type})
+            tpl = ""
+            currentYear = datetime.date.today().year
+            footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+            tpl = str(Template(file=get_template_file('public_upload_request_uploader.tmpl'), searchList=[locals(),globals()]))
+        else:
+            raise cherrypy.HTTPError(500, "Unable to load upload request") if format == "content_only" else cherrypy.HTTPRedirect("%s/upload_request?msg=2" % (config['root_url']))
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        banner = session.query(ConfigParameter).filter(ConfigParameter.name=='banner').one().value
+        headerHTML = str(Template(file=get_template_file('header.tmpl'), searchList=[locals(),globals()]))
+        footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+        footerHTML = str(Template(file=get_template_file('footer.tmpl'), searchList=[locals(),globals()]))
+        uploadRequestUploaderHTML = ""
+        if format == "content_only":
+            uploadRequestUploaderHTML = tpl
+        else:
+            uploadRequestUploaderHTML = headerHTML+tpl+footerHTML
+        return uploadRequestUploaderHTML
+
+    @cherrypy.expose
+    def public_download(self, shareId, **kwargs):
+        user = None
+        message, publicShare, config = None, None, cherrypy.request.app.config['filelocker']
+        orgConfig = get_config_dict_from_objects(session.query(ConfigParameter).filter(ConfigParameter.name.like('org_%')).all())
+        cherrypy.response.timeout = 36000
+        shareId = strip_tags(shareId)
+
+        try:
+            publicShare = session.query(PublicShare).filter(PublicShare.id==shareId).one()
+            if cherrypy.session.has_key("public_share_id") == False or cherrypy.session.get("public_share_id") != publicShare.id:
+                password = kwargs['password'] if kwargs.has_key("password") else None
+                if publicShare.password == None or (password is not None and Encryption.compare_password_hash(password, publicShare.password)):
+                    cherrypy.session['public_share_id'] = publicShare.id
+                elif password == None:
+                    message = "This file share is password protected."
+                    publicShare = None
+                elif password is not None and Encryption.compare_password_hash(password, publicShare.password) == False:
+                    message = "Invalid password"
+                    publicShare = None
+                else:
+                    publicShare = None
+        except sqlalchemy.orm.exc.NoResultFound:
+            message = "Invalid Share ID"
+            shareId = None
+        except Exception, e:
+            message = "Unable to access download page: %s " % str(e)
+        currentYear = datetime.date.today().year
+        geoTagging = get_config_dict_from_objects([session.query(ConfigParameter).filter(ConfigParameter.name=='geotagging').one()])['geotagging']
+        banner = session.query(ConfigParameter).filter(ConfigParameter.name=='banner').one().value
+        headerHTML = str(Template(file=get_template_file('header.tmpl'), searchList=[locals(),globals()]))
+        footerText = str(Template(file=get_template_file('footer_text.tmpl'), searchList=[locals(),globals()]))
+        footerHTML = str(Template(file=get_template_file('footer.tmpl'), searchList=[locals(),globals()]))
+        tpl = str(Template(file=get_template_file('public_download_landing.tmpl'), searchList=[locals(),globals()]))
+        publicDownloadHTML = headerHTML+tpl+footerHTML
+        return publicDownloadHTML
+
+    @cherrypy.expose
+    def get_server_messages(self, format="json", **kwargs):
+        sMessages, fMessages = [], []
+        if cherrypy.session.has_key("sMessages") and cherrypy.session.has_key("fMessages"):
+            for message in cherrypy.session.get("sMessages"):
+                if message not in sMessages:
+                    #Interestingly, either the browser or the ajax upload script tries to re-submit a rejected file a few times resulting in duplicate messages
+                    sMessages.append(message)
+            for message in cherrypy.session.get("fMessages"):
+                if message not in fMessages:
+                    fMessages.append(message)
+            (cherrypy.session["sMessages"], cherrypy.session["fMessages"]) = [], []
+        return fl_response(sMessages, fMessages, format)
