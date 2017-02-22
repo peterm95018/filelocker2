@@ -35,6 +35,13 @@ def requires_login(permissionId=None, **kwargs):
         format = cherrypy.request.params['format']
     if cherrypy.session.has_key("user") and cherrypy.session.get('user') is not None:
         user = cherrypy.session.get('user')
+        #Get shibboleth uid attribute
+        if hasattr(cherrypy.request, 'headers'):
+            remote_user = cherrypy.request.headers['X-UID']
+            if user.id != remote_user: 
+                cherrypy.lib.sessions.expire()
+                raise cherrypy.HTTPRedirect(rootURL)
+            
         if user.date_tos_accept == None:
             raise cherrypy.HTTPRedirect(rootURL+"/sign_tos")
         elif permissionId is not None:
